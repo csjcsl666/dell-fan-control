@@ -103,7 +103,14 @@ fn send(req: Request) -> i32 {
 fn main() {
     let cli = Cli::parse();
     ipc::use_simulator(cli.simulate);
-    let code = match cli.command.unwrap_or(Cmd::Gui) {
+    let command = cli.command.unwrap_or(Cmd::Gui);
+    if matches!(command, Cmd::Probe | Cmd::Status { .. }) {
+        // print-only commands end quietly when piped into head; never done
+        // for the service, where a closed client socket must not kill it
+        // SAFETY: setting a signal disposition has no memory preconditions
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+    let code = match command {
         Cmd::Gui => {
             init_log("warn,wgpu=error,iced_wgpu=error,naga=error,cosmic_text=error");
             gui::run(cli.simulate)
