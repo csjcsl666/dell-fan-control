@@ -218,9 +218,15 @@ fn smart_mode_closed_loop_cools_and_limits_writes() {
         smart_temp < firmware_temp - 1.0,
         "{smart_temp} vs {firmware_temp}"
     );
+    let writes_to_settle = r.writes();
     // steady state: very few writes in the last ten minutes
     let n = r.writes();
     r.ticks(600);
+    println!(
+        "closed loop: firmware only {firmware_temp:.1} C, smart {smart_temp:.1} C, boost {:?}, writes to settle {writes_to_settle}, writes in next 600 s {}",
+        r.boost(),
+        r.writes() - n
+    );
     assert!(
         r.writes() - n <= 2,
         "{} writes in steady state",
