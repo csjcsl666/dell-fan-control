@@ -1,0 +1,45 @@
+[package]
+name = "dell-fan-control"
+version = "0.1.0-dev.1"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Linux fan control for Dell G15 laptops through the in-kernel alienware-wmi driver"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/csjcsl666/dell-fan-control"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "dell_fan_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dell-fan-control"
+path = "src/main.rs"
+
+[features]
+default = ["nvml"]
+# Read GPU power and utilisation through the NVIDIA management library (dlopen at runtime)
+nvml = ["dep:nvml-wrapper"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+iced = { version = "0.14.0", features = ["tokio"] }
+ksni = "0.3.3"
+libc = "0.2"
+log = "0.4"
+nvml-wrapper = { version = "0.11", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+zbus = { version = "5.14", default-features = false, features = ["tokio", "blocking-api"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
