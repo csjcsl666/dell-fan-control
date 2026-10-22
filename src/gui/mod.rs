@@ -509,7 +509,7 @@ impl App {
                 out.push(banner(
                     Banner::Error,
                     format!(
-                        "临界温度保护已触发：{}，两个风扇 boost 255",
+                        "临界温度保护已触发：{}，两个风扇使用已验证的最高 boost",
                         c.guard.reason.clone().unwrap_or_default()
                     ),
                     None,
@@ -664,7 +664,7 @@ impl App {
             Mode::Custom => {
                 let mut col = column![
                     text("自定义").size(16),
-                    text("Boost 是在固件基准转速之上附加的提升量，范围 0 到 255。0 表示不附加，交给固件；255 表示接近最大转速，但不保证电机达到标称最高 RPM。").size(13).style(muted),
+                    text("Boost 是在固件基准转速之上附加的提升量，0 表示不附加，交给固件。本机实测 160 已让两个风扇超过驱动报告的最高转速，软件只开放 0 到 160。").size(13).style(muted),
                 ]
                 .spacing(10);
                 for fan in Fan::ALL {
@@ -676,13 +676,13 @@ impl App {
                                 text(fan.label_zh()).size(15),
                                 space().width(Length::Fill),
                                 text(format!(
-                                    "Boost {v} / 255 · 读回 {} · {} RPM",
+                                    "Boost {v} / 160 · 读回 {} · {} RPM",
                                     f.readback.map(|b| b.get().to_string()).unwrap_or("--".into()),
                                     f.rpm.map(|r| r.to_string()).unwrap_or("--".into())
                                 ))
                                 .size(13),
                             ],
-                            slider(0u8..=255, v, move |x| Message::SliderMoved(fan, x))
+                            slider(0u8..=crate::hw::MAX_VERIFIED_BOOST, v, move |x| Message::SliderMoved(fan, x))
                                 .on_release(Message::SliderReleased(fan)),
                         ]
                         .spacing(6),

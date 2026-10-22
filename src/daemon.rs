@@ -277,6 +277,16 @@ fn control_loop(
                         save = true;
                         Response::Ok
                     }
+                    Request::SetCustom { boost, .. } if boost > crate::hw::Boost::VERIFIED_MAX => {
+                        Response::error(
+                            "BOOST_ABOVE_VERIFIED",
+                            format!(
+                                "boost {} 超过已验证的上限 {}",
+                                boost.get(),
+                                crate::hw::MAX_VERIFIED_BOOST
+                            ),
+                        )
+                    }
                     Request::SetCustom { fan, boost } => {
                         c.set_custom(fan, boost);
                         settings.custom[fan.index()] = boost;

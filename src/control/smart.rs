@@ -67,6 +67,10 @@ pub struct GuardParams {
     pub gpu_release_c: f32,
     /// The guard stays engaged at least this long once tripped
     pub min_hold_s: f32,
+    /// Boost applied while the guard is engaged. Never above the verified
+    /// ceiling; the firmware's own over temperature protection stays
+    /// underneath because boost only adds to the firmware speed
+    pub boost: u8,
 }
 
 impl Default for GuardParams {
@@ -82,6 +86,7 @@ impl Default for GuardParams {
             gpu_trip_c: 87.0,
             gpu_release_c: 80.0,
             min_hold_s: 30.0,
+            boost: crate::hw::MAX_VERIFIED_BOOST,
         }
     }
 }
@@ -129,11 +134,11 @@ pub struct SmartParams {
 pub fn default_cpu_curve() -> Curve {
     Curve::new(&[
         (55.0, 0),
-        (65.0, 25),
-        (72.0, 70),
-        (78.0, 130),
-        (84.0, 200),
-        (90.0, 255),
+        (65.0, 20),
+        (72.0, 50),
+        (78.0, 90),
+        (84.0, 130),
+        (90.0, 160),
     ])
     .expect("default CPU curve is valid")
 }
@@ -141,11 +146,11 @@ pub fn default_cpu_curve() -> Curve {
 pub fn default_gpu_curve() -> Curve {
     Curve::new(&[
         (50.0, 0),
-        (60.0, 25),
-        (68.0, 80),
-        (75.0, 150),
-        (82.0, 230),
-        (86.0, 255),
+        (60.0, 20),
+        (68.0, 60),
+        (75.0, 100),
+        (82.0, 140),
+        (86.0, 160),
     ])
     .expect("default GPU curve is valid")
 }
@@ -166,7 +171,8 @@ impl Default for SmartParams {
             gpu_power_full_w: 90.0,
             gpu_power_lead_c: 3.0,
             cross_coupling: 0.0,
-            noise_cap: 255,
+            // boost above 160 has not been verified on this laptop
+            noise_cap: crate::hw::MAX_VERIFIED_BOOST,
             cpu_curve: default_cpu_curve(),
             gpu_curve: default_gpu_curve(),
             steps: StepLimits::default(),
@@ -556,7 +562,7 @@ impl SmartEngine {
             if guard_on {
                 return FanDecision {
                     fan,
-                    target: Boost::MAX,
+                    target: Boost::new(p.guard.boost.min(crate::hw::MAX_VERIFIED_BOOST)),
                     driver: FanDriver::Guard,
                 };
             }
@@ -711,8 +717,8 @@ mod tests {
             );
             prev = cpu_target(x);
         }
-        // at 79.5 °C raw the curve asks for ~140; look ahead puts it higher
-        assert!(prev >= 140, "{prev}");
+        // at 79.5 °C raw the curve asks for ~100; look ahead puts it higher
+        assert!(prev >= 110, "{prev}");
         assert_eq!(d.last().unwrap().cpu.phase, Phase::Rising);
     }
 
@@ -780,17 +786,17 @@ mod tests {
         let mut e = SmartEngine::new(SmartParams::default());
         // CPU busy, GPU idle
         let d = run(&mut e, &vec![(85.0, 45.0); 30], 0.0);
-        assert!(cpu_target(d.last().unwrap()) > 180);
+        assert!(cpu_target(d.last().unwrap()) > 120);
         assert_eq!(gpu_target(d.last().unwrap()), 0);
         // GPU busy, CPU idle
         let mut e = SmartEngine::new(SmartParams::default());
         let d = run(&mut e, &vec![(55.0, 80.0); 30], 0.0);
         assert_eq!(cpu_target(d.last().unwrap()), 0);
-        assert!(gpu_target(d.last().unwrap()) > 180);
+        assert!(gpu_target(d.last().unwrap()) > 120);
         // both busy
         let mut e = SmartEngine::new(SmartParams::default());
         let d = run(&mut e, &vec![(85.0, 80.0); 30], 0.0);
-        assert!(cpu_target(d.last().unwrap()) > 180 && gpu_target(d.last().unwrap()) > 180);
+        assert!(cpu_target(d.last().unwrap()) > 120 && gpu_target(d.last().unwrap()) > 120);
     }
 
     #[test]
@@ -803,7 +809,7 @@ mod tests {
         let d = run(&mut e, &vec![(55.0, 82.0); 30], 0.0);
         let last = d.last().unwrap();
         assert_eq!(last.fans.as_ref().unwrap()[0].driver, FanDriver::Coupled);
-        assert!(cpu_target(last) > 90);
+        assert!(cpu_target(last) > 60);
     }
 
     #[test]
@@ -895,8 +901,9 @@ mod tests {
         };
         let mut e = SmartEngine::new(p);
         let d = e.step(&input(97.0, 50.0), 0.0);
-        assert_eq!(cpu_target(&d), 255);
-        assert_eq!(gpu_target(&d), 255);
+        // the guard uses the highest verified boost, above the noise cap
+        assert_eq!(cpu_target(&d), 160);
+        assert_eq!(gpu_target(&d), 160);
         assert_eq!(d.fans.as_ref().unwrap()[0].driver, FanDriver::Guard);
         // below trip but above release: still engaged
         assert!(e.step(&input(93.0, 50.0), 40.0).guard.engaged);
@@ -905,6 +912,17 @@ mod tests {
         e2.step(&input(97.0, 50.0), 0.0);
         assert!(e2.step(&input(80.0, 50.0), 10.0).guard.engaged);
         assert!(!e2.step(&input(80.0, 50.0), 31.0).guard.engaged);
+    }
+
+    #[test]
+    fn smart_mode_never_asks_for_more_than_the_verified_ceiling() {
+        let mut e = SmartEngine::new(SmartParams::default());
+        let temps: Vec<_> = (0..200)
+            .map(|i| (60.0 + i as f32 * 0.2, 55.0 + i as f32 * 0.2))
+            .collect();
+        for d in run(&mut e, &temps, 0.0) {
+            assert!(cpu_target(&d) <= 160 && gpu_target(&d) <= 160);
+        }
     }
 
     #[test]

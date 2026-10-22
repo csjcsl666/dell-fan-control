@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 /// 2: guard thresholds recalibrated after the first hardware run; smart
 /// parameters of older files are default values (there is no editor yet) and
 /// are replaced
-pub const CONFIG_VERSION: u32 = 2;
+/// 3: boost ceiling 160 for curves, noise cap and guard
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

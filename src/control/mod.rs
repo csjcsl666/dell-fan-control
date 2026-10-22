@@ -188,6 +188,7 @@ const OVERRIDE_SETTLE_S: f64 = 2.5;
 const OVERRIDE_WINDOW_S: f64 = 120.0;
 const OVERRIDE_LIMIT: usize = 3;
 const WRITE_FAILURE_LIMIT: u32 = 3;
+const GUARD_LONG_S: f64 = 120.0;
 
 fn custom_limits() -> StepLimits {
     // Custom values come from a slider; only debounce them
@@ -219,6 +220,7 @@ pub struct Controller {
     permission_reported: bool,
     /// Set by every hardware write so the tick can read back fresh values
     wrote: bool,
+    guard_long_reported: bool,
 }
 
 fn unix_now() -> u64 {
@@ -276,6 +278,7 @@ impl Controller {
             status,
             permission_reported: false,
             wrote: false,
+            guard_long_reported: false,
         }
     }
 
@@ -360,7 +363,7 @@ impl Controller {
     }
 
     pub fn set_custom(&mut self, fan: Fan, boost: Boost) {
-        self.custom[fan.index()] = boost;
+        self.custom[fan.index()] = boost.min(Boost::VERIFIED_MAX);
     }
 
     pub fn set_smart_params(&mut self, p: SmartParams) {
@@ -516,6 +519,8 @@ impl Controller {
 
     fn write(&mut self, fan: Fan, value: Boost, now: f64, readings: Option<&SensorReadings>) {
         let i = fan.index();
+        // hard ceiling for every path: modes, guard, requests
+        let value = value.min(Boost::VERIFIED_MAX);
         if now < self.fans[i].retry_at {
             return;
         }
@@ -827,10 +832,12 @@ impl Controller {
                     readings.and_then(|r| r.gpu_temp_c),
                     now,
                 );
-                self.log_guard_change(was_on, &self.custom_guard.clone());
+                self.log_guard_change(was_on, &self.custom_guard.clone(), now);
+                let guard_boost =
+                    Boost::new(self.engine.params().guard.boost).min(Boost::VERIFIED_MAX);
                 for fan in Fan::ALL {
                     targets[fan.index()] = Some(if guard_on {
-                        (Boost::MAX, true)
+                        (guard_boost.max(self.custom[fan.index()]), true)
                     } else {
                         (self.custom[fan.index()], false)
                     });
@@ -847,7 +854,7 @@ impl Controller {
                 };
                 let was_on = self.status.guard.engaged;
                 let d = self.engine.step(&input, now);
-                self.log_guard_change(was_on, &d.guard);
+                self.log_guard_change(was_on, &d.guard, now);
                 match &d.fans {
                     Some(fans) => {
                         for fd in fans {
@@ -924,16 +931,35 @@ impl Controller {
         state
     }
 
-    fn log_guard_change(&mut self, was_on: bool, g: &Guard) {
+    fn log_guard_change(&mut self, was_on: bool, g: &Guard, now: f64) {
         match (was_on, g.engaged) {
-            (false, true) => self.log(
-                "warn",
-                format!(
-                    "临界温度保护触发：{}，两个风扇 boost 255",
-                    g.reason.clone().unwrap_or_default()
-                ),
-            ),
+            (false, true) => {
+                self.guard_long_reported = false;
+                let b = self
+                    .engine
+                    .params()
+                    .guard
+                    .boost
+                    .min(crate::hw::MAX_VERIFIED_BOOST);
+                self.log(
+                    "warn",
+                    format!(
+                        "临界温度保护触发：{}，两个风扇 boost {b}（已验证的最高值）",
+                        g.reason.clone().unwrap_or_default()
+                    ),
+                )
+            }
             (true, false) => self.log("info", "临界温度保护解除，回到正常控制"),
+            (true, true)
+                if !self.guard_long_reported
+                    && g.engaged_at.is_some_and(|at| now - at >= GUARD_LONG_S) =>
+            {
+                self.guard_long_reported = true;
+                self.log(
+                        "warn",
+                        "临界保护已持续 120 秒，软件已使用验证过的最高 boost，此后依靠 Dell 固件自身的过热保护（降频）",
+                    );
+            }
             _ => {}
         }
     }

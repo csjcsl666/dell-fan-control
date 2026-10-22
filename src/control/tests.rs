@@ -255,13 +255,13 @@ fn a_crashed_instance_is_cleaned_up_by_the_next_start() {
     r.c.set_enabled(true);
     r.ticks(2);
     r.c.set_mode(Mode::Custom);
-    r.c.set_custom(Fan::Cpu, Boost::new(180));
+    r.c.set_custom(Fan::Cpu, Boost::new(150));
     r.ticks(2);
     r.c.set_mode(Mode::Performance);
     r.ticks(1);
     r.c.set_mode(Mode::Custom);
     r.ticks(2);
-    assert_eq!(r.boost()[0], 180);
+    assert_eq!(r.boost()[0], 150);
     // simulate SIGKILL: the controller is dropped without any restore
     let marker_path = r.c.marker.path().to_path_buf();
     drop(std::mem::replace(
@@ -314,12 +314,12 @@ fn write_success_without_rpm_change_is_reported() {
     });
     r.hw.lock().faults.boost_ignored = true;
     r.c.set_mode(Mode::Custom);
-    r.c.set_custom(Fan::Cpu, Boost::new(200));
+    r.c.set_custom(Fan::Cpu, Boost::new(150));
     r.c.set_enabled(true);
     let s = r.ticks(15);
     assert_eq!(
         s.fans[0].readback,
-        Some(Boost::new(200)),
+        Some(Boost::new(150)),
         "read back matches"
     );
     assert_eq!(
@@ -430,5 +430,29 @@ fn custom_mode_guard_overrides_low_values() {
     r.c.set_enabled(true);
     let s = r.tick();
     assert!(s.guard.engaged);
-    assert_eq!(r.boost(), [255, 255]);
+    assert_eq!(r.boost(), [160, 160]);
+}
+
+#[test]
+fn nothing_above_the_verified_ceiling_is_ever_written() {
+    let mut r = Rig::with(SimulatedLaptop {
+        cpu_temp_c: 99.0,
+        cpu_heat_w: 120.0,
+        ..Default::default()
+    });
+    r.c.set_mode(Mode::Custom);
+    r.c.set_custom(Fan::Cpu, Boost::new(250));
+    r.c.set_custom(Fan::Gpu, Boost::MAX);
+    r.c.set_enabled(true);
+    r.ticks(20);
+    r.c.set_mode(Mode::Smart);
+    r.ticks(60);
+    let max =
+        r.hw.lock()
+            .writes
+            .iter()
+            .map(|(_, b)| b.get())
+            .max()
+            .unwrap();
+    assert_eq!(max, 160, "highest value ever written");
 }

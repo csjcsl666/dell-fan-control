@@ -62,9 +62,15 @@ impl fmt::Display for Fan {
 #[serde(transparent)]
 pub struct Boost(u8);
 
+/// Highest boost verified on the G15 5515 (2026-10-23: 160 already drives
+/// both fans above the RPM the driver reports as maximum). The controller
+/// never writes more than this, whatever the mode, the guard or the request
+pub const MAX_VERIFIED_BOOST: u8 = 160;
+
 impl Boost {
     pub const ZERO: Boost = Boost(0);
     pub const MAX: Boost = Boost(255);
+    pub const VERIFIED_MAX: Boost = Boost(MAX_VERIFIED_BOOST);
 
     pub const fn new(value: u8) -> Self {
         Boost(value)
