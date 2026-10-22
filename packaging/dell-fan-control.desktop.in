@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Dell Fan Control
+Name[zh_CN]=戴尔风扇控制（Dell Fan Control）
+Name[zh_TW]=戴爾風扇控制（Dell Fan Control）
+GenericName=Fan Control
+GenericName[zh_CN]=风扇控制
+Comment=Control the fans of a Dell G15 laptop through the alienware-wmi driver
+Comment[zh_CN]=通过 alienware-wmi 驱动控制 Dell G15 笔记本风扇
+Exec=@EXEC@ gui
+Icon=dell-fan-control
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=Dell;Fan;Dell Fan Control;Cooling;Thermal;Temperature;G15;戴尔;风扇;散热;温度;温控;
+Keywords[zh_CN]=戴尔;风扇;散热;温度;温控;Dell;Fan;Dell Fan Control;
+StartupNotify=true
+StartupWMClass=dell-fan-control
+SingleMainWindow=true

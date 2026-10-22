@@ -1,0 +1,5 @@
+# Dell Fan Control: let one user write the two fan boost attributes of the
+# alienware-wmi hwmon device. Nothing else changes owner. Ownership is reset
+# by the kernel whenever the device is recreated, so the rule runs on add
+# Installed by scripts/install-system.sh for uid @UID@
+ACTION=="add|change", SUBSYSTEM=="hwmon", ATTR{name}=="alienware_wmi", RUN+="/usr/bin/chown @UID@ /sys%p/fan1_boost /sys%p/fan2_boost"

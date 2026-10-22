@@ -1,0 +1,30 @@
+[Unit]
+Description=Dell Fan Control background service
+Documentation=https://github.com/csjcsl666/dell-fan-control
+# Five failed starts within five minutes stop the restart loop; the fans stay
+# with the firmware because ExecStopPost restores after every run
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/opt/dell-fan-control/current/dell-fan-control daemon
+# Runs after every stop: normal, crash, SIGKILL, watchdog timeout. It only
+# undoes what the marker file records, so it is a no-op after a clean quit
+ExecStopPost=%h/.local/opt/dell-fan-control/current/dell-fan-control restore
+Restart=on-failure
+RestartSec=3
+# The control thread pings the watchdog every one to three seconds. If it
+# hangs, systemd kills the service and the restore above runs
+WatchdogSec=20
+TimeoutStartSec=30
+TimeoutStopSec=20
+Environment=RUST_LOG=info,zbus=warn,ksni=warn,tracing=warn
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
