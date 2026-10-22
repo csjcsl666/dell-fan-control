@@ -189,6 +189,7 @@ const OVERRIDE_WINDOW_S: f64 = 120.0;
 const OVERRIDE_LIMIT: usize = 3;
 const WRITE_FAILURE_LIMIT: u32 = 3;
 const GUARD_LONG_S: f64 = 120.0;
+const AT_MAXIMUM_FACTOR: f32 = 1.1;
 
 fn custom_limits() -> StepLimits {
     // Custom values come from a slider; only debounce them
@@ -556,7 +557,9 @@ impl Controller {
                 let from = before.unwrap_or(Boost::ZERO);
                 if value > from && value.get() - from.get() >= RESPONSE_MIN_STEP {
                     if let (Some(rpm), Some(max)) = (rpm, max)
-                        && rpm as f32 >= max as f32 * 0.9
+                        // the driver's max is not a hard limit: boost 160 measured 4500 to
+                        // 4850 RPM against a reported 4200, so only well above it counts
+                        && rpm as f32 >= max as f32 * AT_MAXIMUM_FACTOR
                     {
                         t.response = Response::AtMaximum;
                         t.pending = None;
