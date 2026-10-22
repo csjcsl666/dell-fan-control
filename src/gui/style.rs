@@ -97,14 +97,23 @@ pub fn is_dark(mode: ThemeMode) -> bool {
 }
 
 /// Window background alpha for the chosen look
+///
+/// Compositor blur cannot be relied on (it can be disabled per window by
+/// rules), so the values assume no blur at all: only the gaps between the
+/// cards are translucent, every block of text sits on a nearly solid card
 pub fn window_alpha(transparent_surface: bool, appearance: Appearance) -> f32 {
     if !transparent_surface {
         return 1.0;
     }
     match appearance {
         Appearance::Opaque => 1.0,
-        _ => 0.80,
+        _ => 0.90,
     }
+}
+
+/// Card background alpha, kept high for readability in every mode
+pub fn card_alpha(window_alpha: f32) -> f32 {
+    window_alpha.max(0.95)
 }
 
 pub fn muted(theme: &Theme) -> Color {
@@ -117,7 +126,7 @@ pub fn card(theme: &Theme, alpha: f32) -> container::Style {
     let base = p.background.weak.color;
     container::Style {
         background: Some(Background::Color(Color {
-            a: (alpha + 0.12).min(1.0),
+            a: card_alpha(alpha),
             ..base
         })),
         border: Border {
