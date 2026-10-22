@@ -7,7 +7,10 @@ use crate::state::write_json_atomic;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_VERSION: u32 = 1;
+/// 2: guard thresholds recalibrated after the first hardware run; smart
+/// parameters of older files are default values (there is no editor yet) and
+/// are replaced
+pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,7 +70,17 @@ impl SettingsStore {
                 Some(format!("无法读取配置 {}：{e}", self.path.display())),
             ),
             Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-                Ok(s) => (s, None),
+                Ok(mut s) => {
+                    if s.version < CONFIG_VERSION {
+                        log::info!(
+                            "配置版本 {} 升级到 {CONFIG_VERSION}，智能参数恢复为新默认值",
+                            s.version
+                        );
+                        s.smart = SmartParams::default();
+                        s.version = CONFIG_VERSION;
+                    }
+                    (s, None)
+                }
                 Err(e) => {
                     let backup = self.path.with_extension("json.invalid");
                     let _ = std::fs::rename(&self.path, &backup);
@@ -116,6 +129,28 @@ mod tests {
         let (d, err) = st.load();
         assert!(!d.enabled);
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn version_1_smart_parameters_are_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SettingsStore::new(tmp.path());
+        let mut old = Settings {
+            version: 1,
+            enabled: true,
+            mode: Mode::Custom,
+            ..Default::default()
+        };
+        old.smart.guard.cpu_trip_c = 92.0;
+        st.save(&old).unwrap();
+        let (s, _) = st.load();
+        assert_eq!(s.version, CONFIG_VERSION);
+        assert!(s.enabled, "user choices are kept");
+        assert_eq!(s.mode, Mode::Custom);
+        assert_eq!(
+            s.smart.guard.cpu_trip_c,
+            SmartParams::default().guard.cpu_trip_c
+        );
     }
 
     #[test]

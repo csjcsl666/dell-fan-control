@@ -421,8 +421,8 @@ fn driver_disappearing_keeps_marker_for_later_restore() {
 #[test]
 fn custom_mode_guard_overrides_low_values() {
     let mut r = Rig::with(SimulatedLaptop {
-        cpu_temp_c: 95.0,
-        cpu_heat_w: 80.0,
+        cpu_temp_c: 98.0,
+        cpu_heat_w: 95.0,
         ..Default::default()
     });
     r.c.set_mode(Mode::Custom);

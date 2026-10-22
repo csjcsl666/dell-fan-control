@@ -820,12 +820,14 @@ impl Controller {
             }
             Mode::Custom => {
                 limits = custom_limits();
+                let was_on = self.custom_guard.engaged;
                 let guard_on = self.custom_guard.update(
                     &self.engine.params().guard,
                     readings.and_then(|r| r.cpu_temp_c),
                     readings.and_then(|r| r.gpu_temp_c),
                     now,
                 );
+                self.log_guard_change(was_on, &self.custom_guard.clone());
                 for fan in Fan::ALL {
                     targets[fan.index()] = Some(if guard_on {
                         (Boost::MAX, true)
@@ -843,7 +845,9 @@ impl Controller {
                     cpu_load_pct: extras.cpu_load_pct,
                     gpu_power_w: extras.gpu.as_ref().and_then(|g| g.power_w),
                 };
+                let was_on = self.status.guard.engaged;
                 let d = self.engine.step(&input, now);
+                self.log_guard_change(was_on, &d.guard);
                 match &d.fans {
                     Some(fans) => {
                         for fd in fans {
@@ -918,6 +922,20 @@ impl Controller {
             return ControlState::Fallback("两个风扇的 boost 都被固件持续覆盖".into());
         }
         state
+    }
+
+    fn log_guard_change(&mut self, was_on: bool, g: &Guard) {
+        match (was_on, g.engaged) {
+            (false, true) => self.log(
+                "warn",
+                format!(
+                    "临界温度保护触发：{}，两个风扇 boost 255",
+                    g.reason.clone().unwrap_or_default()
+                ),
+            ),
+            (true, false) => self.log("info", "临界温度保护解除，回到正常控制"),
+            _ => {}
+        }
     }
 
     /// Restore everything without changing the saved switch, for quitting

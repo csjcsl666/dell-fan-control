@@ -71,14 +71,16 @@ pub struct GuardParams {
 
 impl Default for GuardParams {
     fn default() -> Self {
-        // Initial values, not yet calibrated on this laptop. The 5800H is
-        // specified up to 105 °C; the trip leaves a wide margin and the
-        // firmware keeps its own protection underneath in any case
+        // Calibrated against the first hardware run (2026-10-23): with only the
+        // Steam client open the firmware keeps the CPU at 91 to 93 °C with the
+        // fan at 3600 RPM, so a trip at 92 °C fired during normal use. The
+        // trip now sits above that band and below the 105 °C limit of the
+        // 5800H; the firmware keeps its own protection underneath
         GuardParams {
-            cpu_trip_c: 92.0,
-            cpu_release_c: 84.0,
-            gpu_trip_c: 86.0,
-            gpu_release_c: 78.0,
+            cpu_trip_c: 96.0,
+            cpu_release_c: 90.0,
+            gpu_trip_c: 87.0,
+            gpu_release_c: 80.0,
             min_hold_s: 30.0,
         }
     }
@@ -892,24 +894,33 @@ mod tests {
             ..Default::default()
         };
         let mut e = SmartEngine::new(p);
-        let d = e.step(&input(93.0, 50.0), 0.0);
+        let d = e.step(&input(97.0, 50.0), 0.0);
         assert_eq!(cpu_target(&d), 255);
         assert_eq!(gpu_target(&d), 255);
         assert_eq!(d.fans.as_ref().unwrap()[0].driver, FanDriver::Guard);
         // below trip but above release: still engaged
-        assert!(e.step(&input(88.0, 50.0), 40.0).guard.engaged);
+        assert!(e.step(&input(93.0, 50.0), 40.0).guard.engaged);
         // below release but before the minimum hold: still engaged
         let mut e2 = SmartEngine::new(SmartParams::default());
-        e2.step(&input(93.0, 50.0), 0.0);
+        e2.step(&input(97.0, 50.0), 0.0);
         assert!(e2.step(&input(80.0, 50.0), 10.0).guard.engaged);
         assert!(!e2.step(&input(80.0, 50.0), 31.0).guard.engaged);
+    }
+
+    #[test]
+    fn normal_firmware_operating_temperatures_do_not_trip_the_guard() {
+        // measured on the G15 5515 with the Steam client open: CPU 91 to 93 °C
+        let mut e = SmartEngine::new(SmartParams::default());
+        let temps: Vec<_> = (0..300).map(|i| (91.0 + (i % 3) as f32, 73.0)).collect();
+        let d = run(&mut e, &temps, 0.0);
+        assert!(d.iter().all(|x| !x.guard.engaged));
     }
 
     #[test]
     fn guard_uses_raw_temperature_not_the_average() {
         let mut e = SmartEngine::new(SmartParams::default());
         run(&mut e, &vec![(60.0, 50.0); 60], 0.0);
-        let d = e.step(&input(95.0, 50.0), 60.0);
+        let d = e.step(&input(98.0, 50.0), 60.0);
         assert!(d.guard.engaged);
     }
 
