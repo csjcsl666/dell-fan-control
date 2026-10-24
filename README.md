@@ -83,6 +83,24 @@ dell-fan-control probe             # 只读检测硬件
 dell-fan-control --simulate daemon # 模拟笔记本，不访问真实硬件
 ```
 
+## 界面与毛玻璃
+
+- 深色玻璃分层：窗口底、CPU 与 GPU 卡片、功能面板各有不同的透明度、细描边与柔和阴影，选中的按钮用青色描边与柔光表示，视觉语言参考 tr1xem/AWCC，没有复制其布局与素材
+- 外观三档：自动（没有合成器模糊时也保持可读）、半透明（适合合成器会模糊的窗口）、不透明（完全实心）
+- 背景模糊由合成器完成，iced 本身不能模糊窗口后面的内容；illogical-impulse 的 Hyprland 配置默认对所有窗口关闭模糊，可以只为本软件开启：
+
+```bash
+cp packaging/hyprland/dell_fan_control_rules.lua ~/.config/hypr/custom/
+# 在 ~/.config/hypr/custom/rules.lua 末尾加入：
+# if is_file_exists(HOME .. "/.config/hypr/custom/dell_fan_control_rules.lua") then
+#     require("custom.dell_fan_control_rules")
+# end
+```
+
+  这条规则只匹配 class `dell-fan-control`，只设置 `no_blur = false` 与固定不透明度 1.0，不设置浮动、尺寸或位置，窗口照常平铺、浮动、移动与缩放
+- 页面滚动不显示滚动条，滚轮与触控板照常滚动；窄于 640 像素时 CPU 与 GPU 卡片纵向排列；最近事件默认显示 6 条，展开后最多 50 条
+- 顶部只显示当前仍成立的提示，已恢复的自动消失，历史在最近事件中保留；模拟模式会明确标注
+
 ## 智能模式
 
 分段线性曲线、双时间尺度 EMA、升降双阈值迟滞、降速保持时间、非对称步长、临界温度保护，CPU 与 GPU 各自计算散热需求后再协调输出，界面可查看每一层的中间值
