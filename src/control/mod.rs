@@ -6,12 +6,14 @@
 
 pub mod curve;
 pub mod filter;
+pub mod response;
 pub mod smart;
 
 use crate::hw::gpu::GpuReading;
 use crate::hw::{Boost, Fan, FanHardware, HwError, SensorReadings, WriteAccess};
 use crate::profile::ProfileBackend;
 use crate::state::{AppliedMarker, MarkerStore, ProfileChange};
+use response::{ResponseMonitor, ResponseState, Transition};
 use serde::{Deserialize, Serialize};
 use smart::{
     Guard, OutputPlan, OutputStage, SmartDecision, SmartEngine, SmartInputs, SmartParams,
@@ -66,22 +68,6 @@ pub struct Extras {
     pub platform_profile: Option<String>,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Response {
-    /// No recent increase to judge by
-    #[default]
-    Unknown,
-    /// Waiting for the fan to react to a write
-    Pending,
-    /// RPM rose after the last increase
-    Responding,
-    /// RPM did not rise after the last increase
-    NoResponse,
-    /// The fan was already close to its maximum
-    AtMaximum,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FanStatus {
     pub fan: Option<Fan>,
@@ -94,8 +80,9 @@ pub struct FanStatus {
     pub rpm: Option<u32>,
     pub max_rpm: Option<u32>,
     pub plan: Option<OutputPlan>,
-    pub response: Response,
-    pub no_response_count: u32,
+    pub response: ResponseState,
+    /// Step windows without evidence since the last confirmation
+    pub response_misses: u32,
     pub override_count: u32,
     pub blocked: Option<String>,
     pub last_error: Option<String>,
@@ -125,6 +112,40 @@ pub struct Event {
     pub unix_s: u64,
     pub level: String,
     pub text: String,
+    /// Identical events are merged: how often it happened
+    #[serde(default = "one")]
+    pub count: u32,
+    /// First occurrence of a merged event, unix seconds
+    #[serde(default)]
+    pub first_unix: u64,
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertLevel {
+    /// Something the user should know, not a fault
+    Info,
+    /// The program is protecting the machine or fell back to the firmware
+    Warning,
+    /// Control failed or cannot work
+    Error,
+}
+
+/// A condition that holds right now. Alerts are rebuilt every tick, so a
+/// condition that clears disappears by itself and one condition is never
+/// listed twice
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub key: String,
+    pub level: AlertLevel,
+    pub fan: Option<Fan>,
+    pub text: String,
+    /// When this condition was first seen, unix seconds
+    pub since_unix: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -147,15 +168,14 @@ pub struct ControlStatus {
     pub write_access: WriteAccess,
     pub simulated: bool,
     pub hardware: String,
+    pub alerts: Vec<Alert>,
     pub events: Vec<Event>,
 }
 
 #[derive(Debug, Default)]
 struct FanTrack {
     output: OutputStage,
-    pending: Option<(f64, u32, Boost)>,
-    response: Response,
-    no_response: u32,
+    response: ResponseMonitor,
     override_times: VecDeque<f64>,
     blocked: Option<String>,
     failures: u32,
@@ -180,16 +200,12 @@ impl RestoreReport {
     }
 }
 
-const MAX_EVENTS: usize = 40;
-const RESPONSE_DELAY_S: f64 = 12.0;
-const RESPONSE_MIN_RISE_RPM: u32 = 200;
-const RESPONSE_MIN_STEP: u8 = 40;
+pub const MAX_EVENTS: usize = 50;
 const OVERRIDE_SETTLE_S: f64 = 2.5;
 const OVERRIDE_WINDOW_S: f64 = 120.0;
 const OVERRIDE_LIMIT: usize = 3;
 const WRITE_FAILURE_LIMIT: u32 = 3;
 const GUARD_LONG_S: f64 = 120.0;
-const AT_MAXIMUM_FACTOR: f32 = 1.1;
 
 fn custom_limits() -> StepLimits {
     // Custom values come from a slider; only debounce them
@@ -222,6 +238,7 @@ pub struct Controller {
     /// Set by every hardware write so the tick can read back fresh values
     wrote: bool,
     guard_long_reported: bool,
+    alert_since: std::collections::HashMap<String, u64>,
 }
 
 fn unix_now() -> u64 {
@@ -260,6 +277,7 @@ impl Controller {
             write_access: hw.write_access(),
             simulated: hw.is_simulated(),
             hardware: hw.describe(),
+            alerts: Vec::new(),
             events: Vec::new(),
         };
         Controller {
@@ -280,6 +298,7 @@ impl Controller {
             permission_reported: false,
             wrote: false,
             guard_long_reported: false,
+            alert_since: std::collections::HashMap::new(),
         }
     }
 
@@ -290,10 +309,26 @@ impl Controller {
             "warn" => log::warn!("{text}"),
             _ => log::info!("{text}"),
         }
+        // an identical event anywhere in the history is merged into one entry
+        // that moves to the newest position and counts its occurrences
+        let now = unix_now();
+        if let Some(pos) = self
+            .events
+            .iter()
+            .position(|e| e.text == text && e.level == level)
+            && let Some(mut e) = self.events.remove(pos)
+        {
+            e.count = e.count.saturating_add(1);
+            e.unix_s = now;
+            self.events.push_back(e);
+            return;
+        }
         self.events.push_back(Event {
-            unix_s: unix_now(),
+            unix_s: now,
             level: level.into(),
             text,
+            count: 1,
+            first_unix: now,
         });
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
@@ -518,7 +553,7 @@ impl Controller {
         Some(self.restore_all())
     }
 
-    fn write(&mut self, fan: Fan, value: Boost, now: f64, readings: Option<&SensorReadings>) {
+    fn write(&mut self, fan: Fan, value: Boost, now: f64, rpm_before: Option<u32>) {
         let i = fan.index();
         // hard ceiling for every path: modes, guard, requests
         let value = value.min(Boost::VERIFIED_MAX);
@@ -552,22 +587,8 @@ impl Controller {
                 if value == Boost::ZERO && back == Some(Boost::ZERO) {
                     let _ = self.marker.remove_fan(fan);
                 }
-                let rpm = readings.and_then(|r| r.fan(fan).rpm);
-                let max = readings.and_then(|r| r.fan(fan).max_rpm);
                 let from = before.unwrap_or(Boost::ZERO);
-                if value > from && value.get() - from.get() >= RESPONSE_MIN_STEP {
-                    if let (Some(rpm), Some(max)) = (rpm, max)
-                        // the driver's max is not a hard limit: boost 160 measured 4500 to
-                        // 4850 RPM against a reported 4200, so only well above it counts
-                        && rpm as f32 >= max as f32 * AT_MAXIMUM_FACTOR
-                    {
-                        t.response = Response::AtMaximum;
-                        t.pending = None;
-                    } else if let Some(rpm) = rpm {
-                        t.pending = Some((now, rpm, value));
-                        t.response = Response::Pending;
-                    }
-                }
+                t.response.note_write(from, value, now, rpm_before);
                 log::debug!(
                     "{fan} boost {} -> {} 读回 {:?}",
                     from.get(),
@@ -602,26 +623,21 @@ impl Controller {
             let mut new_event = None;
             {
                 let t = &mut self.fans[i];
-                if let Some((at, rpm_before, _)) = t.pending
-                    && now - at >= RESPONSE_DELAY_S
+                match t
+                    .response
+                    .update(now, reading.boost, reading.rpm, reading.max_rpm)
                 {
-                    t.pending = None;
-                    match reading.rpm {
-                        Some(rpm) if rpm >= rpm_before + RESPONSE_MIN_RISE_RPM => {
-                            t.response = Response::Responding;
-                            t.no_response = 0;
-                        }
-                        Some(rpm) => {
-                            t.response = Response::NoResponse;
-                            t.no_response += 1;
-                            new_event = Some(format!(
-                                "{} 提高 boost 后 {RESPONSE_DELAY_S:.0} 秒 RPM 从 {rpm_before} 变为 {rpm}，未见明显响应（累计 {} 次）",
-                                fan.label_zh(),
-                                t.no_response
-                            ));
-                        }
-                        None => t.response = Response::Unknown,
+                    Transition::BecameUnconfirmed => {
+                        new_event = Some(format!(
+                            "{} 连续 {} 次提高 boost 后都没有观察到转速变化，响应无法确认",
+                            fan.label_zh(),
+                            t.response.misses()
+                        ))
                     }
+                    Transition::BecameConfirmed => {
+                        new_event = Some(format!("{} 已观察到转速随 boost 变化", fan.label_zh()))
+                    }
+                    Transition::None => {}
                 }
                 // firmware override: the driver reports something else than we wrote
                 if let (Some(w), Some(r)) = (t.output.last_written, reading.boost)
@@ -629,8 +645,9 @@ impl Controller {
                     && t.blocked.is_none()
                 {
                     let settled = t
-                        .pending
-                        .is_none_or(|(at, _, _)| now - at >= OVERRIDE_SETTLE_S);
+                        .output
+                        .last_write_at()
+                        .is_none_or(|at| now - at >= OVERRIDE_SETTLE_S);
                     if settled {
                         t.override_times.push_back(now);
                         while t
@@ -706,8 +723,8 @@ impl Controller {
                 rpm: r.rpm,
                 max_rpm: r.max_rpm,
                 plan: t.last_plan.clone(),
-                response: t.response,
-                no_response_count: t.no_response,
+                response: t.response.state(),
+                response_misses: t.response.misses(),
                 override_count: t.override_times.len() as u32,
                 blocked: t.blocked.clone(),
                 last_error: t.last_error.clone(),
@@ -744,8 +761,10 @@ impl Controller {
             write_access: access,
             simulated: self.hw.is_simulated(),
             hardware: self.hw.describe(),
+            alerts: Vec::new(),
             events: self.events.iter().cloned().collect(),
         };
+        self.status.alerts = self.current_alerts();
         &self.status
     }
 
@@ -922,7 +941,7 @@ impl Controller {
                 .plan(&limits, target, readback, now, bypass);
             self.fans[i].last_plan = Some(plan.clone());
             if let OutputPlan::Write(v) = plan {
-                self.write(fan, v, now, readings);
+                self.write(fan, v, now, readings.and_then(|r| r.fan(fan).rpm));
             }
         }
         if let Some(f) = self.fault.clone() {
@@ -965,6 +984,111 @@ impl Controller {
             }
             _ => {}
         }
+    }
+
+    fn current_alerts(&mut self) -> Vec<Alert> {
+        let st = &self.status;
+        let mut out: Vec<(String, AlertLevel, Option<Fan>, String)> = Vec::new();
+        match &st.state {
+            ControlState::Fault(r) => out.push((
+                "fault".into(),
+                AlertLevel::Error,
+                None,
+                format!("控制失败，已停止写入：{r}；请关闭后重新打开总开关"),
+            )),
+            ControlState::NoPermission(r) => {
+                out.push(("permission".into(), AlertLevel::Error, None, r.clone()))
+            }
+            ControlState::Fallback(r) => out.push((
+                "fallback".into(),
+                AlertLevel::Warning,
+                None,
+                format!("已临时交还固件：{r}"),
+            )),
+            ControlState::Restoring => out.push((
+                "restoring".into(),
+                AlertLevel::Warning,
+                None,
+                "正在撤销软件设置并交还固件控制".into(),
+            )),
+            _ => {}
+        }
+        if let Some(e) = &st.read_error {
+            out.push((
+                "read".into(),
+                AlertLevel::Error,
+                None,
+                format!("读取传感器失败：{e}"),
+            ));
+        }
+        if st.guard.engaged {
+            out.push((
+                "guard".into(),
+                AlertLevel::Warning,
+                None,
+                format!(
+                    "临界温度保护：{}，两个风扇使用已验证的最高 boost",
+                    st.guard.reason.clone().unwrap_or_default()
+                ),
+            ));
+        }
+        if st.enabled {
+            for f in &st.fans {
+                let Some(fan) = f.fan else { continue };
+                if let Some(b) = &f.blocked {
+                    out.push((
+                        format!("blocked-{fan}"),
+                        AlertLevel::Error,
+                        Some(fan),
+                        format!("{} 控制失败：{b}", fan.label_zh()),
+                    ));
+                } else if let Some(e) = &f.last_error {
+                    out.push((
+                        format!("write-{fan}"),
+                        AlertLevel::Error,
+                        Some(fan),
+                        format!("{} 写入异常：{e}", fan.label_zh()),
+                    ));
+                } else if f.override_count > 0 {
+                    out.push((
+                        format!("override-{fan}"),
+                        AlertLevel::Warning,
+                        Some(fan),
+                        format!(
+                            "{} 最近 {} 次读回与写入不一致，正在重新写入",
+                            fan.label_zh(),
+                            f.override_count
+                        ),
+                    ));
+                }
+                if f.response == ResponseState::Unconfirmed {
+                    out.push((
+                        format!("response-{fan}"),
+                        AlertLevel::Info,
+                        Some(fan),
+                        format!("{} 响应无法确认：最近几次提高 boost 后没有观察到转速变化，控制本身没有报错", fan.label_zh()),
+                    ));
+                }
+            }
+        }
+        let now = unix_now();
+        let mut since = std::mem::take(&mut self.alert_since);
+        since.retain(|k, _| out.iter().any(|(key, ..)| key == k));
+        let alerts = out
+            .into_iter()
+            .map(|(key, level, fan, text)| {
+                let s = *since.entry(key.clone()).or_insert(now);
+                Alert {
+                    key,
+                    level,
+                    fan,
+                    text,
+                    since_unix: s,
+                }
+            })
+            .collect();
+        self.alert_since = since;
+        alerts
     }
 
     /// Restore everything without changing the saved switch, for quitting

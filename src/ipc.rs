@@ -36,6 +36,22 @@ pub enum Request {
     },
     /// Restore firmware control and stop the service
     Quit,
+    /// Inject a fault into the simulated laptop; refused by the real service
+    Simulate {
+        fault: SimFault,
+        on: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimFault {
+    BoostIgnored,
+    FirmwareResetsBoost,
+    SensorsMissing,
+    WriteError,
+    /// Log 100 distinct events, to check the history limit
+    EventFlood,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -7,19 +7,23 @@
 
 pub mod style;
 
+use crate::control::response::ResponseState;
 use crate::control::smart::{FanDriver, OutputPlan, Phase, SensorState, SourceDecision};
-use crate::control::{ControlState, FanStatus, Mode, Response as FanResponse};
+use crate::control::{AlertLevel, ControlState, ControlStatus, FanStatus, Mode};
 use crate::hw::{Boost, Fan, WriteAccess};
 use crate::ipc::{self, DaemonStatus, Request, Response};
 use crate::state::write_json_atomic;
+use iced::font::Weight;
 use iced::futures::SinkExt;
+use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{
-    Column, Row, button, column, container, row, scrollable, slider, space, text, toggler,
+    Column, Row, button, column, container, responsive, row, scrollable, slider, space, text,
+    toggler,
 };
-use iced::{Alignment, Color, Element, Font, Length, Subscription, Task, Theme, window};
+use iced::{Alignment, Element, Font, Length, Subscription, Task, Theme, window};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use style::{Appearance, Banner};
+use style::{Appearance, Glass, Tone};
 
 pub const APP_ID: &str = "dell-fan-control";
 
@@ -28,14 +32,24 @@ pub const APP_ID: &str = "dell-fan-control";
 pub struct GuiPrefs {
     pub appearance: Appearance,
     pub show_details: bool,
+    /// Whether the full event history is expanded
+    pub show_events: bool,
+    /// Custom and smart panels folded to a one line summary
+    pub mode_panel_collapsed: bool,
 }
 
-fn prefs_path() -> std::path::PathBuf {
-    crate::config::default_config_dir().join("gui.json")
+/// The simulator keeps its own preferences so tests never touch the real ones
+fn prefs_path(simulate: bool) -> std::path::PathBuf {
+    let d = crate::config::default_config_dir();
+    if simulate {
+        d.join("simulate/gui.json")
+    } else {
+        d.join("gui.json")
+    }
 }
 
-fn load_prefs() -> GuiPrefs {
-    std::fs::read(prefs_path())
+fn load_prefs(simulate: bool) -> GuiPrefs {
+    std::fs::read(prefs_path(simulate))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
@@ -99,9 +113,10 @@ pub fn run(simulate: bool) -> i32 {
     // leaked on purpose: the lock must live as long as the process
     std::mem::forget(lock);
 
-    let prefs = load_prefs();
+    let prefs = load_prefs(simulate);
     let transparent = prefs.appearance.wants_transparent_surface();
     let font = pick_cjk_font();
+    style::set_family(font);
     let mut settings = iced::Settings {
         id: Some(APP_ID.into()),
         ..Default::default()
@@ -110,8 +125,8 @@ pub fn run(simulate: bool) -> i32 {
         settings.default_font = Font::with_name(f);
     }
     let mut win = window::Settings {
-        size: iced::Size::new(760.0, 860.0),
-        min_size: Some(iced::Size::new(560.0, 520.0)),
+        size: iced::Size::new(760.0, 820.0),
+        min_size: Some(iced::Size::new(420.0, 360.0)),
         transparent,
         icon: window::icon::from_rgba(crate::icon::rgba(128), 128, 128).ok(),
         exit_on_close_request: true,
@@ -158,6 +173,9 @@ pub enum Message {
     Appearance(Appearance),
     SystemTheme(iced::theme::Mode),
     ToggleDetails,
+    ToggleEvents,
+    ToggleModePanel,
+    DismissAction,
     Raise,
     ExitNow,
 }
@@ -224,18 +242,14 @@ impl App {
     }
 
     fn style(&self, theme: &Theme) -> iced::theme::Style {
-        let p = theme.palette();
         iced::theme::Style {
-            background_color: Color {
-                a: style::window_alpha(self.transparent_surface, self.prefs.appearance),
-                ..p.background
-            },
-            text_color: p.text,
+            background_color: style::window_background(self.glass()),
+            text_color: theme.palette().text,
         }
     }
 
     fn save_prefs(&self) {
-        if let Err(e) = write_json_atomic(&prefs_path(), &self.prefs) {
+        if let Err(e) = write_json_atomic(&prefs_path(self.simulate), &self.prefs) {
             log::warn!("保存界面设置失败：{e}");
         }
     }
@@ -372,6 +386,15 @@ impl App {
                 self.prefs.show_details = !self.prefs.show_details;
                 self.save_prefs();
             }
+            Message::ToggleEvents => {
+                self.prefs.show_events = !self.prefs.show_events;
+                self.save_prefs();
+            }
+            Message::DismissAction => self.action_error = None,
+            Message::ToggleModePanel => {
+                self.prefs.mode_panel_collapsed = !self.prefs.mode_panel_collapsed;
+                self.save_prefs();
+            }
             Message::ExitNow => return iced::exit(),
             Message::Raise => {
                 return window::latest().and_then(window::gain_focus);
@@ -388,160 +411,205 @@ impl App {
         ])
     }
 
-    fn alpha(&self) -> f32 {
-        style::window_alpha(self.transparent_surface, self.prefs.appearance)
+    fn glass(&self) -> Glass {
+        Glass::new(self.dark, self.transparent_surface, self.prefs.appearance)
     }
 
     fn card<'a>(&self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-        let a = self.alpha();
+        let g = self.glass();
+        container(content)
+            .padding(18)
+            .width(Length::Fill)
+            .style(move |_| style::card(g))
+            .into()
+    }
+
+    fn panel<'a>(&self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let g = self.glass();
         container(content)
             .padding(16)
             .width(Length::Fill)
-            .style(move |t| style::card(t, a))
+            .style(move |_| style::panel(g))
             .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let mut page = Column::new().spacing(14).padding(20).width(Length::Fill);
+        let g = self.glass();
+        // the layout follows the real window size, whatever the compositor
+        // gives us: tiled, floating, maximised or small
+        container(responsive(move |size| self.page(size.width)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| style::root(g))
+            .into()
+    }
+
+    fn page(&self, width: f32) -> Element<'_, Message> {
+        let narrow = width < NARROW_WIDTH;
+        let pad = if narrow { 14 } else { 22 };
+        let mut page = Column::new().spacing(14).padding(pad).width(Length::Fill);
         page = page.push(self.header());
-        for b in self.banners() {
-            page = page.push(b);
+        for n in self.notices() {
+            page = page.push(n);
         }
         if let Some(s) = &self.status {
-            page = page.push(self.metrics(s));
+            page = page.push(self.metrics(s, narrow));
             page = page.push(self.modes(s));
             page = page.push(self.mode_panel(s));
-            if self.prefs.show_details {
-                page = page.push(self.events(s));
-            }
+            page = page.push(self.events(s));
         }
         page = page.push(self.settings());
-        scrollable(page).height(Length::Fill).into()
+        // scrolling stays fully available (wheel, touchpad, keyboard), only the
+        // bar is not drawn, so the glass edge on the right stays clean
+        scrollable(page)
+            .direction(Direction::Vertical(Scrollbar::hidden()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn header(&self) -> Element<'_, Message> {
         let enabled = self.status.as_ref().is_some_and(|s| s.control.enabled);
         let title = column![
-            text("戴尔风扇控制").size(26),
+            text("戴尔风扇控制")
+                .size(26)
+                .font(style::font(Weight::Semibold)),
             text(if self.simulate {
                 "Dell Fan Control · 模拟数据，不会控制真实风扇"
             } else {
                 "Dell Fan Control · alienware-wmi"
             })
             .size(13)
-            .style(|t: &Theme| text::Style {
-                color: Some(style::muted(t))
-            }),
+            .style(muted),
         ]
         .spacing(2);
         let switch = toggler(enabled)
             .label("启用风扇控制")
-            .text_size(17)
-            .size(26)
+            .text_size(16)
+            .size(24)
+            .style(style::glass_toggler)
             .on_toggle_maybe(self.status.is_some().then_some(Message::SetEnabled));
         row![title, space().width(Length::Fill), switch]
             .align_y(Alignment::Center)
             .into()
     }
 
-    fn banners(&self) -> Vec<Element<'_, Message>> {
+    fn notice_bar<'a>(
+        &self,
+        tone: Tone,
+        msg: String,
+        action: Option<(&'static str, Message)>,
+    ) -> Element<'a, Message> {
+        let g = self.glass();
+        let mut r = Row::new()
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .push(
+                container(space().width(8).height(8))
+                    .width(8)
+                    .height(8)
+                    .style(move |t| style::dot(t, tone)),
+            )
+            .push(text(msg).size(14).width(Length::Fill));
+        if let Some((label, m)) = action {
+            r = r.push(
+                button(text(label).size(13))
+                    .padding([6, 12])
+                    .style(style::ghost_button)
+                    .on_press(m),
+            );
+        }
+        container(r)
+            .padding([10, 14])
+            .width(Length::Fill)
+            .style(move |t| style::notice(t, g, tone))
+            .into()
+    }
+
+    /// Conditions that hold right now. History lives in the events card
+    fn notices(&self) -> Vec<Element<'_, Message>> {
         let mut out = Vec::new();
-        let banner = |kind: Banner,
-                      msg: String,
-                      action: Option<(&'static str, Message)>|
-         -> Element<'_, Message> {
-            let mut r = Row::new()
-                .spacing(12)
-                .align_y(Alignment::Center)
-                .push(text(msg).size(14).width(Length::Fill));
-            if let Some((label, m)) = action {
-                r = r.push(button(text(label).size(13)).on_press(m));
-            }
-            container(r)
-                .padding(12)
-                .width(Length::Fill)
-                .style(move |t| style::banner(t, kind))
-                .into()
-        };
         if let Some(e) = &self.connection_error {
-            out.push(banner(
-                Banner::Error,
+            out.push(self.notice_bar(
+                Tone::Error,
                 format!("后台服务未连接：{e}"),
                 (!self.simulate).then_some(("启动后台服务", Message::StartService)),
             ));
         }
         if let Some(e) = &self.action_error {
-            out.push(banner(Banner::Error, e.clone(), None));
+            out.push(self.notice_bar(
+                Tone::Error,
+                e.clone(),
+                Some(("知道了", Message::DismissAction)),
+            ));
         }
         if let Some(n) = &self.notice {
-            out.push(banner(Banner::Info, n.clone(), None));
+            out.push(self.notice_bar(Tone::Info, n.clone(), None));
         }
-        if let Some(s) = &self.status {
-            let c = &s.control;
-            let (kind, msg) = match &c.state {
-                ControlState::Off => (
-                    Banner::Info,
-                    "软件控制已关闭，风扇完全由 Dell 固件控制".to_string(),
+        let Some(s) = &self.status else { return out };
+        let c = &s.control;
+        if c.simulated {
+            out.push(self.notice_bar(
+                Tone::Info,
+                "模拟测试模式：数据、警告与事件都来自模拟笔记本，与真实硬件无关".into(),
+                None,
+            ));
+        }
+        let (tone, msg) = match &c.state {
+            ControlState::Off => (
+                Tone::Neutral,
+                "软件控制已关闭，风扇完全由 Dell 固件控制".to_string(),
+            ),
+            ControlState::Firmware => (
+                Tone::Ok,
+                format!(
+                    "{}模式：风扇由固件策略控制，本软件不写入 boost",
+                    c.mode.label_zh()
                 ),
-                ControlState::Restoring => (Banner::Warn, "正在撤销软件设置并交还固件控制".into()),
-                ControlState::Firmware => (
-                    Banner::Ok,
-                    format!(
-                        "{}模式：风扇由固件策略控制，本软件不写入 boost",
-                        c.mode.label_zh()
-                    ),
-                ),
-                ControlState::Controlling => {
-                    (Banner::Ok, format!("{}模式：软件控制中", c.mode.label_zh()))
-                }
-                ControlState::Fallback(r) => (Banner::Warn, format!("已临时交还固件：{r}")),
-                ControlState::NoPermission(r) => (Banner::Error, r.clone()),
-                ControlState::Fault(r) => (
-                    Banner::Error,
-                    format!("控制已停止：{r}。请关闭后重新打开总开关"),
-                ),
+            ),
+            ControlState::Controlling => {
+                (Tone::Ok, format!("{}模式：软件控制中", c.mode.label_zh()))
+            }
+            // these states come with their own alert below
+            _ => (Tone::Neutral, String::new()),
+        };
+        if !msg.is_empty() {
+            out.push(self.notice_bar(tone, msg, None));
+        }
+        let mut alerts = c.alerts.clone();
+        alerts.sort_by_key(|a| std::cmp::Reverse(a.level));
+        for a in alerts.into_iter().take(MAX_NOTICES) {
+            let tone = match a.level {
+                AlertLevel::Error => Tone::Error,
+                AlertLevel::Warning => Tone::Warn,
+                AlertLevel::Info => Tone::Info,
             };
-            out.push(banner(kind, msg, None));
-            if let Some(e) = &c.read_error {
-                out.push(banner(Banner::Error, format!("读取传感器失败：{e}"), None));
-            }
-            if c.guard.engaged {
-                out.push(banner(
-                    Banner::Error,
-                    format!(
-                        "临界温度保护已触发：{}，两个风扇使用已验证的最高 boost",
-                        c.guard.reason.clone().unwrap_or_default()
-                    ),
-                    None,
-                ));
-            }
-            if let Some(e) = &s.config_error {
-                out.push(banner(Banner::Warn, e.clone(), None));
-            }
-            if c.write_access == WriteAccess::PermissionDenied && c.state != ControlState::Off {
-                out.push(banner(
-                    Banner::Warn,
-                    "当前用户不能写入 fan*_boost，均衡与性能模式可用，自定义与智能模式需要先安装 udev 规则".into(),
-                    None,
-                ));
-            }
-            for f in &c.fans {
-                if let Some(b) = &f.blocked {
-                    out.push(banner(Banner::Warn, format!("{}：{b}", fan_name(f)), None));
-                }
-                if f.response == FanResponse::NoResponse {
-                    out.push(banner(
-                        Banner::Warn,
-                        format!("{}：boost 已写入但转速没有明显变化", fan_name(f)),
-                        None,
-                    ));
-                }
-            }
+            out.push(self.notice_bar(tone, a.text, None));
+        }
+        if c.alerts.len() > MAX_NOTICES {
+            out.push(self.notice_bar(
+                Tone::Neutral,
+                format!(
+                    "另有 {} 条提示，见下方最近事件",
+                    c.alerts.len() - MAX_NOTICES
+                ),
+                None,
+            ));
+        }
+        if let Some(e) = &s.config_error {
+            out.push(self.notice_bar(Tone::Warn, e.clone(), None));
+        }
+        if c.write_access == WriteAccess::PermissionDenied && c.state == ControlState::Off {
+            out.push(self.notice_bar(
+                Tone::Warn,
+                "当前用户不能写入 fan*_boost，自定义与智能模式需要先安装 udev 规则".into(),
+                None,
+            ));
         }
         out
     }
 
-    fn metrics(&self, s: &DaemonStatus) -> Element<'_, Message> {
+    fn metrics(&self, s: &DaemonStatus, narrow: bool) -> Element<'_, Message> {
         let c = &s.control;
         let r = c.readings.as_ref();
         let tile = |label: &'static str,
@@ -549,30 +617,46 @@ impl App {
                     fan: &FanStatus,
                     extra: String|
          -> Element<'_, Message> {
+            let (chip_tone, chip_text) = fan_condition(c, fan);
             let temp_txt = temp.map(|t| format!("{t:.0}")).unwrap_or("--".into());
-            let rpm = fan.rpm.map(|v| v.to_string()).unwrap_or("--".into());
-            let max = fan.max_rpm.map(|v| format!(" / {v}")).unwrap_or_default();
+            let rpm = fan
+                .rpm
+                .map(|v| format!("{v} RPM"))
+                .unwrap_or("-- RPM".into());
             let boost = fan
                 .readback
-                .map(|b| format!("Boost {} / 255", b.get()))
+                .map(|b| format!("Boost {}", b.get()))
                 .unwrap_or("Boost --".into());
+            let reference = fan
+                .max_rpm
+                .map(|m| format!(" · 驱动参考上限 {m}"))
+                .unwrap_or_default();
             self.card(
                 column![
-                    text(label).size(14).style(|t: &Theme| text::Style {
-                        color: Some(style::muted(t))
-                    }),
-                    row![text(temp_txt).size(44), text("°C").size(18)]
-                        .align_y(Alignment::End)
-                        .spacing(4),
-                    text(format!("风扇 {rpm}{max} RPM")).size(15),
-                    text(boost).size(13).style(|t: &Theme| text::Style {
-                        color: Some(style::muted(t))
-                    }),
-                    text(extra).size(13).style(|t: &Theme| text::Style {
-                        color: Some(style::muted(t))
-                    }),
+                    row![
+                        text(label)
+                            .size(14)
+                            .font(style::font(Weight::Semibold))
+                            .style(muted),
+                        space().width(Length::Fill),
+                        container(text(chip_text).size(12))
+                            .padding([3, 10])
+                            .style(move |t| style::chip(t, chip_tone)),
+                    ]
+                    .align_y(Alignment::Center),
+                    row![
+                        text(temp_txt).size(48).font(style::font(Weight::Semibold)),
+                        text("°C").size(18).style(muted)
+                    ]
+                    .align_y(Alignment::End)
+                    .spacing(4),
+                    text(format!("风扇 {rpm}"))
+                        .size(16)
+                        .font(style::font(Weight::Medium)),
+                    text(format!("{boost}{reference}")).size(13).style(muted),
+                    text(extra).size(13).style(muted),
                 ]
-                .spacing(4),
+                .spacing(5),
             )
         };
         let cpu_extra = format!(
@@ -607,51 +691,62 @@ impl App {
                 None => "电源未知",
             }
         );
-        column![
-            row![
-                tile("CPU", r.and_then(|r| r.cpu_temp_c), &c.fans[0], cpu_extra),
-                tile("GPU", r.and_then(|r| r.gpu_temp_c), &c.fans[1], gpu_extra),
-            ]
-            .spacing(14),
-            text(profile).size(13).style(|t: &Theme| text::Style {
-                color: Some(style::muted(t))
-            }),
-        ]
-        .spacing(8)
-        .into()
+        let cpu = tile("CPU", r.and_then(|r| r.cpu_temp_c), &c.fans[0], cpu_extra);
+        let gpu = tile("GPU", r.and_then(|r| r.gpu_temp_c), &c.fans[1], gpu_extra);
+        // side by side when there is room, stacked in a narrow window
+        let tiles: Element<'_, Message> = if narrow {
+            column![cpu, gpu].spacing(12).into()
+        } else {
+            row![cpu, gpu].spacing(14).into()
+        };
+        column![tiles, text(profile).size(13).style(muted)]
+            .spacing(8)
+            .into()
     }
 
     fn modes(&self, s: &DaemonStatus) -> Element<'_, Message> {
         let c = &s.control;
-        let mut r = Row::new().spacing(8);
+        let mut r = Row::new().spacing(10);
         for m in Mode::ALL {
             let selected = c.mode == m;
             r = r.push(
-                button(container(text(m.label_zh()).size(15)).center_x(Length::Fill))
-                    .padding([10, 8])
-                    .width(Length::Fill)
-                    .style(move |t, st| style::segment(t, st, selected))
-                    .on_press(Message::SetMode(m)),
+                button(
+                    container(
+                        text(m.label_zh())
+                            .size(15)
+                            .font(style::font(Weight::Medium)),
+                    )
+                    .center_x(Length::Fill),
+                )
+                .padding([11, 8])
+                .width(Length::Fill)
+                .style(move |t, st| style::glass_button(t, st, selected))
+                .on_press(Message::SetMode(m)),
             );
         }
-        self.card(column![text("散热模式").size(16), r].spacing(10))
+        self.panel(
+            column![
+                text("散热模式")
+                    .size(16)
+                    .font(style::font(Weight::Semibold)),
+                r
+            ]
+            .spacing(12),
+        )
     }
 
     fn mode_panel(&self, s: &DaemonStatus) -> Element<'_, Message> {
         let c = &s.control;
-        let muted = |t: &Theme| text::Style {
-            color: Some(style::muted(t)),
-        };
         let body: Element<'_, Message> = match c.mode {
             Mode::Balanced => column![
-                text("均衡").size(16),
-                text("通过 power-profiles-daemon 选择 balanced 档位，风扇完全由 Dell 固件的均衡策略控制，本软件不写入 boost。").size(14).style(muted),
+                text("均衡").size(16).font(style::font(Weight::Semibold)),
+                text("通过 power-profiles-daemon 选择 balanced 档位，风扇完全由 Dell 固件的均衡策略控制，本软件不写入 boost").size(14).style(muted),
             ]
             .spacing(6)
             .into(),
             Mode::Performance => column![
-                text("性能").size(16),
-                text("选择 performance 档位。在 G 系列笔记本上内核会同时开启 G-Mode，它会改变风扇策略，也会放宽 CPU 与 GPU 的功耗限制，不只是提高风扇转速。").size(14).style(muted),
+                text("性能").size(16).font(style::font(Weight::Semibold)),
+                text("选择 performance 档位，G 系列笔记本上内核会同时开启 G-Mode，它会改变风扇策略，也会放宽 CPU 与 GPU 的功耗限制，不只是提高风扇转速").size(14).style(muted),
                 text(format!(
                     "当前平台档位：{}{}",
                     c.platform_profile.clone().unwrap_or("--".into()),
@@ -663,46 +758,81 @@ impl App {
             .into(),
             Mode::Custom => {
                 let mut col = column![
-                    text("自定义").size(16),
-                    text("Boost 是在固件基准转速之上附加的提升量，0 表示不附加，交给固件。本机实测 160 已让两个风扇超过驱动报告的最高转速，软件只开放 0 到 160。").size(13).style(muted),
+                    text("自定义").size(16).font(style::font(Weight::Semibold)),
+                    text("Boost 是在固件基准转速之上附加的提升量，0 表示不附加，交给固件。本机实测 160 已让两个风扇超过驱动报告的参考上限，软件只开放 0 到 160").size(13).style(muted),
                 ]
-                .spacing(10);
+                .spacing(12);
                 for fan in Fan::ALL {
                     let f = &c.fans[fan.index()];
                     let v = self.sliders[fan.index()];
                     col = col.push(
                         column![
                             row![
-                                text(fan.label_zh()).size(15),
+                                text(fan.label_zh()).size(15).font(style::font(Weight::Medium)),
                                 space().width(Length::Fill),
                                 text(format!(
                                     "Boost {v} / 160 · 读回 {} · {} RPM",
                                     f.readback.map(|b| b.get().to_string()).unwrap_or("--".into()),
                                     f.rpm.map(|r| r.to_string()).unwrap_or("--".into())
                                 ))
-                                .size(13),
+                                .size(13)
+                                .style(muted),
                             ],
                             slider(0u8..=crate::hw::MAX_VERIFIED_BOOST, v, move |x| Message::SliderMoved(fan, x))
-                                .on_release(Message::SliderReleased(fan)),
+                                .on_release(Message::SliderReleased(fan))
+                                .style(style::glass_slider),
                         ]
-                        .spacing(6),
+                        .spacing(8),
                     );
                 }
                 col.into()
             }
             Mode::Smart => self.smart_panel(s),
         };
-        self.card(body)
+        if !matches!(c.mode, Mode::Custom | Mode::Smart) {
+            return self.panel(body);
+        }
+        let collapsed = self.prefs.mode_panel_collapsed;
+        let toggle = button(text(if collapsed { "展开" } else { "收起" }).size(13))
+            .padding([6, 12])
+            .style(style::ghost_button)
+            .on_press(Message::ToggleModePanel);
+        if collapsed {
+            let summary = Fan::ALL
+                .iter()
+                .map(|f| {
+                    let x = &c.fans[f.index()];
+                    format!(
+                        "{} Boost {} · {} RPM",
+                        f.label_zh(),
+                        x.readback
+                            .map(|b| b.get().to_string())
+                            .unwrap_or("--".into()),
+                        x.rpm.map(|r| r.to_string()).unwrap_or("--".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("　");
+            return self.panel(
+                row![
+                    text(c.mode.label_zh())
+                        .size(16)
+                        .font(style::font(Weight::Semibold)),
+                    text(summary).size(13).style(muted).width(Length::Fill),
+                    toggle
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            );
+        }
+        self.panel(column![body, row![space().width(Length::Fill), toggle]].spacing(8))
     }
 
     fn smart_panel(&self, s: &DaemonStatus) -> Element<'_, Message> {
         let c = &s.control;
-        let muted = |t: &Theme| text::Style {
-            color: Some(style::muted(t)),
-        };
         let mut col = column![
             row![
-                text("智能").size(16),
+                text("智能").size(16).font(style::font(Weight::Semibold)),
                 space().width(Length::Fill),
                 button(
                     text(if self.prefs.show_details {
@@ -712,10 +842,12 @@ impl App {
                     })
                     .size(13)
                 )
+                .padding([6, 12])
+                .style(style::ghost_button)
                 .on_press(Message::ToggleDetails),
             ]
             .align_y(Alignment::Center),
-            text("双时间尺度 EMA、升降双阈值、降速保持与非对称步长，临界温度保护独立于曲线。")
+            text("双时间尺度 EMA、升降双阈值、降速保持与非对称步长，临界温度保护独立于曲线")
                 .size(13)
                 .style(muted),
         ]
@@ -723,9 +855,12 @@ impl App {
         let Some(d) = &c.smart else {
             return col.push(text("启用风扇控制后开始计算").size(14)).into();
         };
-        for (name, sd, fan) in [("CPU", &d.cpu, &c.fans[0]), ("GPU", &d.gpu, &c.fans[1])] {
+        for (i, (name, sd, fan)) in [("CPU", &d.cpu, &c.fans[0]), ("GPU", &d.gpu, &c.fans[1])]
+            .into_iter()
+            .enumerate()
+        {
             let fan_line = format!(
-                "{name} 风扇：目标 {} · 写入 {} · 读回 {} · {} RPM · {}{}",
+                "{name} 风扇：目标 {} · 写入 {} · 读回 {} · {} RPM · {}{} · {}",
                 fan.target
                     .map(|b| b.get().to_string())
                     .unwrap_or("--".into()),
@@ -739,8 +874,9 @@ impl App {
                 plan_label(fan.plan.as_ref()),
                 d.fans
                     .as_ref()
-                    .map(|f| driver_label(f[if name == "CPU" { 0 } else { 1 }].driver))
+                    .map(|f| driver_label(f[i].driver))
                     .unwrap_or_default(),
+                response_label(fan.response),
             );
             col = col.push(text(format!("{name}：{}", source_summary(sd))).size(14));
             col = col.push(text(fan_line).size(13).style(muted));
@@ -760,22 +896,99 @@ impl App {
     }
 
     fn events(&self, s: &DaemonStatus) -> Element<'_, Message> {
-        let mut col = column![text("最近事件").size(16)].spacing(4);
-        for e in s.control.events.iter().rev().take(10) {
-            col = col.push(text(format!("{} {}", fmt_time(e.unix_s), e.text)).size(12));
+        let ev = &s.control.events;
+        let simulated = s.control.simulated;
+        let shown_n = if self.prefs.show_events {
+            ev.len()
+        } else {
+            ev.len().min(EVENTS_COLLAPSED)
+        };
+        let header = row![
+            text("最近事件")
+                .size(16)
+                .font(style::font(Weight::Semibold)),
+            text(format!(
+                "显示 {shown_n} / 共 {}，最多保留 {}",
+                ev.len(),
+                crate::control::MAX_EVENTS
+            ))
+            .size(12)
+            .style(muted)
+            .width(Length::Fill),
+            button(
+                text(if self.prefs.show_events {
+                    "收起"
+                } else {
+                    "展开"
+                })
+                .size(13)
+            )
+            .padding([6, 12])
+            .style(style::ghost_button)
+            .on_press_maybe((ev.len() > EVENTS_COLLAPSED).then_some(Message::ToggleEvents)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        // newest first; every row uses the full card width and wraps long text
+        let mut list = Column::new().spacing(6).width(Length::Fill);
+        for e in ev.iter().rev().take(shown_n) {
+            let tone = match e.level.as_str() {
+                "error" => Tone::Error,
+                "warn" => Tone::Warn,
+                _ => Tone::Neutral,
+            };
+            let when = if e.count > 1 && e.first_unix > 0 {
+                format!(
+                    "{} 次 · 首次 {} · 最近 {}",
+                    e.count,
+                    fmt_time(e.first_unix),
+                    fmt_time(e.unix_s)
+                )
+            } else {
+                fmt_time(e.unix_s)
+            };
+            let mut line = Row::new()
+                .spacing(10)
+                .align_y(Alignment::Start)
+                .push(
+                    container(space().width(7).height(7))
+                        .width(7)
+                        .height(7)
+                        .padding(0)
+                        .style(move |t| style::dot(t, tone)),
+                )
+                .push(
+                    column![
+                        text(e.text.clone()).size(13).width(Length::Fill),
+                        text(when).size(11).style(muted),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                );
+            if simulated {
+                line = line.push(
+                    container(text("模拟").size(11))
+                        .padding([2, 8])
+                        .style(|t| style::chip(t, Tone::Info)),
+                );
+            }
+            list = list.push(container(line).padding([2, 0]).width(Length::Fill));
         }
-        self.card(col)
+        if ev.is_empty() {
+            list = list.push(text("暂无事件").size(13).style(muted));
+        }
+        self.panel(column![header, list].spacing(10).width(Length::Fill))
     }
 
     fn settings(&self) -> Element<'_, Message> {
-        let mut looks = Row::new().spacing(8);
+        let mut looks = Row::new().spacing(10);
         for a in Appearance::ALL {
             let selected = self.prefs.appearance == a;
             looks = looks.push(
                 button(container(text(a.label()).size(14)).center_x(Length::Fill))
-                    .padding([8, 6])
+                    .padding([9, 6])
                     .width(Length::Fill)
-                    .style(move |t, st| style::segment(t, st, selected))
+                    .style(move |t, st| style::glass_button(t, st, selected))
                     .on_press(Message::Appearance(a)),
             );
         }
@@ -783,39 +996,72 @@ impl App {
             Some(on) => toggler(on)
                 .label("登录时自动启动后台服务")
                 .text_size(14)
+                .style(style::glass_toggler)
                 .on_toggle(Message::SetAutostart),
             None => toggler(false)
                 .label("登录时自动启动（服务未安装）")
-                .text_size(14),
+                .text_size(14)
+                .style(style::glass_toggler),
         };
         let quit = button(text("彻底退出（撤销 boost 并恢复固件控制）").size(14))
             .padding([10, 14])
             .style(style::danger_button)
             .on_press_maybe((self.status.is_some() && !self.quitting).then_some(Message::Quit));
-        self.card(
+        self.panel(
             column![
-                text("设置").size(16),
+                text("设置").size(16).font(style::font(Weight::Semibold)),
                 autostart,
-                text("外观").size(14),
+                text("外观").size(14).style(muted),
                 looks,
                 row![
-                    text("关闭窗口不会停止后台控制")
-                        .size(13)
-                        .style(|t: &Theme| text::Style {
-                            color: Some(style::muted(t))
-                        }),
+                    text("关闭窗口不会停止后台控制").size(13).style(muted),
                     space().width(Length::Fill),
                     quit
                 ]
                 .align_y(Alignment::Center),
             ]
-            .spacing(10),
+            .spacing(12),
         )
     }
 }
 
-fn fan_name(f: &FanStatus) -> &'static str {
-    f.fan.map(|f| f.label_zh()).unwrap_or("风扇")
+/// Upper bound of notification bars at the top; the rest is in the history
+const MAX_NOTICES: usize = 4;
+
+/// Below this window width the cards stack vertically
+const NARROW_WIDTH: f32 = 640.0;
+
+/// Events shown while the history is folded
+const EVENTS_COLLAPSED: usize = 6;
+
+fn muted(t: &Theme) -> text::Style {
+    text::Style {
+        color: Some(style::muted(t)),
+    }
+}
+
+/// Short condition of a fan for the card chip: failure, unconfirmed, normal
+fn fan_condition(c: &ControlStatus, f: &FanStatus) -> (Tone, &'static str) {
+    if !c.enabled || f.target.is_none() {
+        return (Tone::Neutral, "固件控制");
+    }
+    if f.blocked.is_some() || f.last_error.is_some() {
+        return (Tone::Error, "控制失败");
+    }
+    match f.response {
+        ResponseState::Unconfirmed => (Tone::Info, "响应无法确认"),
+        ResponseState::Confirmed => (Tone::Ok, "正常 · 已确认响应"),
+        _ => (Tone::Ok, "正常运行"),
+    }
+}
+
+fn response_label(r: ResponseState) -> &'static str {
+    match r {
+        ResponseState::Idle => "未加速",
+        ResponseState::Observing => "观察中",
+        ResponseState::Confirmed => "已确认响应",
+        ResponseState::Unconfirmed => "响应无法确认",
+    }
 }
 
 fn plan_label(p: Option<&OutputPlan>) -> String {

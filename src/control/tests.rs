@@ -2,6 +2,7 @@
 //! real hardware or power-profiles-daemon
 
 use super::*;
+use crate::control::response::ResponseState;
 use crate::hw::mock::{SharedLaptop, SimulatedLaptop};
 use crate::profile::SharedProfile;
 
@@ -307,7 +308,7 @@ fn firmware_override_is_detected_and_the_fan_is_given_up() {
 }
 
 #[test]
-fn write_success_without_rpm_change_is_reported() {
+fn one_slow_step_is_not_an_alarm() {
     let mut r = Rig::with(SimulatedLaptop {
         cpu_temp_c: 60.0,
         ..Default::default()
@@ -316,18 +317,71 @@ fn write_success_without_rpm_change_is_reported() {
     r.c.set_mode(Mode::Custom);
     r.c.set_custom(Fan::Cpu, Boost::new(150));
     r.c.set_enabled(true);
-    let s = r.ticks(15);
+    let s = r.ticks(60);
     assert_eq!(
         s.fans[0].readback,
         Some(Boost::new(150)),
         "read back matches"
     );
+    assert_ne!(s.fans[0].response, ResponseState::Unconfirmed);
+    assert!(s.alerts.is_empty(), "{:?}", s.alerts);
+}
+
+#[test]
+fn repeated_steps_without_effect_raise_one_info_alert_that_clears() {
+    let mut r = Rig::with(SimulatedLaptop {
+        cpu_temp_c: 60.0,
+        ..Default::default()
+    });
+    r.hw.lock().faults.boost_ignored = true;
+    r.c.set_mode(Mode::Custom);
+    r.c.set_custom(Fan::Cpu, Boost::new(10));
+    r.c.set_enabled(true);
+    r.ticks(35);
+    for v in [60u8, 110, 160] {
+        r.c.set_custom(Fan::Cpu, Boost::new(v));
+        r.ticks(27);
+    }
+    let s = r.tick();
+    assert_eq!(s.fans[0].response, ResponseState::Unconfirmed);
+    let mine: Vec<_> = s
+        .alerts
+        .iter()
+        .filter(|a| a.key == "response-cpu")
+        .collect();
+    assert_eq!(mine.len(), 1, "one alert per fan and condition");
     assert_eq!(
-        s.fans[0].response,
-        Response::NoResponse,
-        "but the fan did not react"
+        mine[0].level,
+        AlertLevel::Info,
+        "unconfirmed is not a failure"
     );
-    assert!(s.events.iter().any(|e| e.text.contains("未见明显响应")));
+    let n_events = s
+        .events
+        .iter()
+        .filter(|e| e.text.contains("响应无法确认"))
+        .count();
+    assert_eq!(n_events, 1, "the transition is logged once");
+    // the fan starts reacting: the alert goes away by itself
+    r.hw.lock().faults.boost_ignored = false;
+    let s = r.ticks(3);
+    assert_eq!(s.fans[0].response, ResponseState::Confirmed);
+    assert!(s.alerts.iter().all(|a| a.key != "response-cpu"));
+}
+
+#[test]
+fn quick_steps_during_startup_are_not_judged() {
+    let mut r = Rig::with(SimulatedLaptop {
+        cpu_temp_c: 60.0,
+        ..Default::default()
+    });
+    r.hw.lock().faults.boost_ignored = true;
+    r.c.set_mode(Mode::Custom);
+    r.c.set_custom(Fan::Cpu, Boost::new(60));
+    r.c.set_enabled(true);
+    r.ticks(13);
+    r.c.set_custom(Fan::Cpu, Boost::new(110));
+    let s = r.ticks(13);
+    assert_ne!(s.fans[0].response, ResponseState::Unconfirmed);
 }
 
 #[test]
@@ -337,10 +391,52 @@ fn a_responding_fan_is_reported_as_such() {
         ..Default::default()
     });
     r.c.set_mode(Mode::Custom);
-    r.c.set_custom(Fan::Cpu, Boost::new(200));
+    r.c.set_custom(Fan::Cpu, Boost::new(150));
     r.c.set_enabled(true);
     let s = r.ticks(15);
-    assert_eq!(s.fans[0].response, Response::Responding);
+    assert_eq!(s.fans[0].response, ResponseState::Confirmed);
+    assert!(s.alerts.is_empty());
+}
+
+#[test]
+fn a_blocked_fan_has_exactly_one_error_alert() {
+    let mut r = Rig::new();
+    r.hw.lock().faults.firmware_resets_boost = true;
+    r.c.set_mode(Mode::Custom);
+    r.c.set_custom(Fan::Cpu, Boost::new(120));
+    r.c.set_enabled(true);
+    let s = r.ticks(60);
+    let cpu: Vec<_> = s
+        .alerts
+        .iter()
+        .filter(|a| a.fan == Some(Fan::Cpu))
+        .collect();
+    assert_eq!(cpu.len(), 1, "{cpu:?}");
+    assert_eq!(cpu[0].level, AlertLevel::Error);
+    // switching off clears control alerts
+    r.c.set_enabled(false);
+    let s = r.ticks(2);
+    assert!(s.alerts.iter().all(|a| a.fan.is_none()), "{:?}", s.alerts);
+}
+
+#[test]
+fn events_are_capped_and_repeats_are_merged() {
+    let mut r = Rig::new();
+    for i in 0..100 {
+        r.c.log("info", format!("事件 {i}"));
+    }
+    for _ in 0..30 {
+        r.c.log("warn", "同一条警告");
+    }
+    let s = r.tick();
+    assert_eq!(s.events.len(), MAX_EVENTS);
+    let last = s.events.last().unwrap();
+    assert_eq!(last.text, "同一条警告");
+    assert_eq!(last.count, 30);
+    assert_eq!(
+        s.events.iter().filter(|e| e.text == "同一条警告").count(),
+        1
+    );
 }
 
 #[test]
@@ -455,4 +551,27 @@ fn nothing_above_the_verified_ceiling_is_ever_written() {
             .max()
             .unwrap();
     assert_eq!(max, 160, "highest value ever written");
+}
+
+#[test]
+fn alternating_repeats_are_merged_with_first_and_latest_time() {
+    let mut r = Rig::new();
+    for _ in 0..5 {
+        r.c.log("warn", "CPU 风扇 警告");
+        r.c.log("warn", "GPU 风扇 警告");
+    }
+    let s = r.tick();
+    let cpu: Vec<_> = s
+        .events
+        .iter()
+        .filter(|e| e.text == "CPU 风扇 警告")
+        .collect();
+    assert_eq!(cpu.len(), 1);
+    assert_eq!(cpu[0].count, 5);
+    assert!(cpu[0].first_unix <= cpu[0].unix_s);
+    assert_eq!(
+        s.events.last().unwrap().text,
+        "GPU 风扇 警告",
+        "latest occurrence is newest"
+    );
 }

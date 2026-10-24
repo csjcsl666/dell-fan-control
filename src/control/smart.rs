@@ -623,6 +623,10 @@ impl OutputStage {
         self.last_write_at = None;
     }
 
+    pub fn last_write_at(&self) -> Option<f64> {
+        self.last_write_at
+    }
+
     pub fn note_written(&mut self, b: Boost, now: f64) {
         self.last_written = Some(b);
         self.last_write_at = Some(now);

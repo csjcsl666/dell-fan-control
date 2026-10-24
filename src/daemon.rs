@@ -43,16 +43,18 @@ pub struct DaemonOptions {
 
 type Shared = Arc<Mutex<Option<DaemonStatus>>>;
 
+/// Handle to the simulated laptop for fault injection; never set for real hardware
+static SIM_HANDLE: std::sync::OnceLock<SharedLaptop> = std::sync::OnceLock::new();
+
 fn build_backends(opts: &DaemonOptions) -> (Box<dyn FanHardware>, Box<dyn ProfileBackend>) {
     if opts.simulate {
         let laptop = SimulatedLaptop {
             cpu_heat_w: 38.0,
             ..SimulatedLaptop::realtime()
         };
-        return (
-            Box::new(SharedLaptop::new(laptop)),
-            Box::new(FakeProfile::default()),
-        );
+        let shared = SharedLaptop::new(laptop);
+        let _ = SIM_HANDLE.set(shared.clone());
+        return (Box::new(shared), Box::new(FakeProfile::default()));
     }
     let hw: Box<dyn FanHardware> = match AlienwareSysfs::discover() {
         Ok(h) => {
@@ -277,6 +279,33 @@ fn control_loop(
                         save = true;
                         Response::Ok
                     }
+                    Request::Simulate { fault, on } => match SIM_HANDLE.get() {
+                        None => Response::error("NOT_SIMULATED", "故障注入只在模拟模式下可用"),
+                        Some(h) => {
+                            use crate::ipc::SimFault;
+                            let mut m = h.lock();
+                            match fault {
+                                SimFault::BoostIgnored => m.faults.boost_ignored = on,
+                                SimFault::FirmwareResetsBoost => {
+                                    m.faults.firmware_resets_boost = on
+                                }
+                                SimFault::SensorsMissing => m.faults.sensors_missing = on,
+                                SimFault::WriteError => m.faults.write_error = on,
+                                SimFault::EventFlood => {}
+                            }
+                            drop(m);
+                            if fault == SimFault::EventFlood {
+                                for i in 1..=100 {
+                                    c.log("info", format!("模拟事件 {i}"));
+                                }
+                            }
+                            c.log(
+                                "warn",
+                                format!("模拟故障 {fault:?} {}", if on { "开启" } else { "关闭" }),
+                            );
+                            Response::Ok
+                        }
+                    },
                     Request::SetCustom { boost, .. } if boost > crate::hw::Boost::VERIFIED_MAX => {
                         Response::error(
                             "BOOST_ABOVE_VERIFIED",

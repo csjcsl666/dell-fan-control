@@ -47,6 +47,17 @@ enum Cmd {
     Custom { fan: FanArg, boost: u8 },
     /// Restore firmware control and stop the service
     Quit,
+    /// Simulator only: switch a fault on or off
+    SimFault { fault: SimFaultArg, state: OnOff },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum SimFaultArg {
+    BoostIgnored,
+    FirmwareResetsBoost,
+    SensorsMissing,
+    WriteError,
+    EventFlood,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -188,6 +199,19 @@ fn main() {
             boost: Boost::new(boost),
         }),
         Cmd::Quit => send(Request::Quit),
+        Cmd::SimFault { fault, state } => {
+            use dell_fan_control::ipc::SimFault;
+            send(Request::Simulate {
+                fault: match fault {
+                    SimFaultArg::BoostIgnored => SimFault::BoostIgnored,
+                    SimFaultArg::FirmwareResetsBoost => SimFault::FirmwareResetsBoost,
+                    SimFaultArg::SensorsMissing => SimFault::SensorsMissing,
+                    SimFaultArg::WriteError => SimFault::WriteError,
+                    SimFaultArg::EventFlood => SimFault::EventFlood,
+                },
+                on: matches!(state, OnOff::On),
+            })
+        }
     };
     std::process::exit(code);
 }
